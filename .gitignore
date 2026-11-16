@@ -1,0 +1,18 @@
+# Переменные окружения и секреты
+.env
+.env.*
+!.env.example
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Локальные и временные данные
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# IDE и системные файлы
+.idea/
+.vscode/
+.DS_Store
