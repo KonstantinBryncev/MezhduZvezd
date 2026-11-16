@@ -90,9 +90,9 @@ class OpenRouterService:
 						used_model = data.get("model") or model_name
 						clean_model = used_model.replace(":free", "")
 
-			# Добавляем аккуратную подпись в конец ответа
-			signed_text = f"{text}\n\n—\n✨ <i>Модель: {clean_model}</i>"
-			return signed_text
+						# Добавляем аккуратную подпись в конец ответа
+						signed_text = f"{text}\n\n—\n✨ <i>Модель: {clean_model}</i>"
+						return signed_text
 
 				except Exception as exc:
 					logger.error("Ошибка при обращении к модели %s: %s", model_name, exc)
