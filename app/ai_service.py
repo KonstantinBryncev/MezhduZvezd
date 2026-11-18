@@ -4,18 +4,15 @@ import logging
 import httpx
 
 from app.cards_service import TarotCard
+from app.config import LLMProviderConfig
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-FALLBACK_FREE_MODELS = [
-	"google/gemma-4-31b-it:free",				# Основная: глубокие и связные трактовки
-	"google/gemma-4-26b-a4b-it:free",			# Быстрая и качественная замена
-	"baidu/ernie-5.5-flash-preview:free",		# Очень быстрая, большой контекст
-	"dots-studio/dots-3-note-preview:free",		# Хорошо связывает карты в раскладе
-	"thinkingmachines/inkling-2-small:free",	# Модель с логическим рассуждением
-	"nvidia/nemotron-3.5-lightning:free",		# Высокая скорость для коротких ответов\
+# Дополнительные бесплатные модели OpenRouter на случай, если основная модель OpenRouter недоступна
+OPENROUTER_EXTRA_FREE_MODELS = [
+	"google/gemma-4-31b-it:free",
+	"google/gemma-4-26b-a4b-it:free",
+	"dots-studio/dots-3-note-preview:free",
 ]
 
 SYSTEM_PROMPT = """Ты — бережный проводник в пространстве саморефлексии «Между звёзд». Ты помогаешь человеку осмыслить его запрос через образы карт Таро.
@@ -29,76 +26,117 @@ SYSTEM_PROMPT = """Ты — бережный проводник в простр�
 6. Пиши спокойным, тёплым, ясным русским языком без эзотерического пафоса. Объём ответа — 180–260 слов, с абзацами для удобного чтения в Telegram. Используй только обычный текст и лёгкие HTML-теги <b> и <i> (без Markdown-символов ** и #)."""
 
 
-
-
 class OpenRouterService:
-	def __init__(self, api_key: str, model: str) -> None:
-		self.api_key = api_key
-		self.model = model
+	def __init__(
+		self,
+		api_key: str = "",
+		model: str = "",
+		providers: list[LLMProviderConfig] | None = None,
+	) -> None:
+		# Собираем итоговую очередь маршрутов (провайдер + модель)
+		self.routes: list[LLMProviderConfig] = list(providers) if providers else []
 
-	def _get_models_chain(self) -> list[str]:
-		chain: list[str] = []
-		for item in [self.model, *FALLBACK_FREE_MODELS]:
-			cleaned = item.strip()
-			if cleaned and cleaned not in chain:
-				chain.append(cleaned)
-		return chain
+		# Обратная совместимость, если сервис вызвали по-старому (только api_key и model)
+		if not self.routes and api_key and model:
+			self.routes.append(
+				LLMProviderConfig(
+					name="OpenRouter",
+					base_url="https://openrouter.ai",
+					api_key=api_key,
+					model=model,
+				)
+			)
+
+		# Если среди маршрутов есть OpenRouter — добавим его бесплатные модели в резерв
+		or_route = next((r for r in self.routes if "openrouter.ai" in r.base_url), None)
+		if or_route is not None:
+			existing_models = {r.model for r in self.routes if r.base_url == or_route.base_url}
+			for extra_model in OPENROUTER_EXTRA_FREE_MODELS:
+				if extra_model not in existing_models:
+					self.routes.append(
+						LLMProviderConfig(
+							name="OpenRouter-Fallback",
+							base_url=or_route.base_url,
+							api_key=or_route.api_key,
+							model=extra_model,
+						)
+					)
 
 	async def _send_chat(self, messages: list[dict[str, str]]) -> str | None:
-		if not self.api_key:
-			logger.warning("OPENROUTER_API_KEY не задан, используется локальный шаблон.")
+		if not self.routes:
+			logger.warning("Не задан ни один API-провайдер LLM, используется локальный шаблон.")
 			return None
 
-		headers = {
-			"Authorization": f"Bearer {self.api_key}",
-			"Content-Type": "application/json",
-			"HTTP-Referer": "https://t.me",
-			"X-Title": "Mezhdu Zvezd Tarot Reflection",
-		}
-
-		models_chain = self._get_models_chain()
-
 		async with httpx.AsyncClient(timeout=35.0) as client:
-			for idx, model_name in enumerate(models_chain):
-				payload = {
-					"model": model_name,
+			for idx, route in enumerate(self.routes):
+				endpoint = f"{route.base_url.rstrip('/')}/chat/completions"
+				headers = {
+					"Authorization": f"Bearer {route.api_key}",
+					"Content-Type": "application/json",
+				}
+				if "openrouter.ai" in route.base_url:
+					headers["HTTP-Referer"] = "https://t.me"
+					headers["X-Title"] = "Mezhdu Zvezd Tarot Reflection"
+
+				payload: dict = {
+					"model": route.model,
 					"messages": messages,
 					"temperature": 0.7,
-					"max_tokens": 2500,
-					"reasoning": {"effort": "none"},
+					"max_tokens": 3000,
 				}
-				try:
-					response = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+				# Для reasoning-моделей AionLabs снижаем глубину размышлений, чтобы ответ шёл сразу в content
+				if "aionlabs.ai" in route.base_url:
+					payload["reasoning_effort"] = "low"
 
-					if response.status_code in (404, 429, 502, 503, 504):
+
+				try:
+					response = await client.post(endpoint, headers=headers, json=payload)
+
+					if response.status_code in (400, 401, 402, 403, 404, 429, 500, 502, 503, 504):
 						logger.warning(
-							"Модель %s вернула %s (%s) — переключаюсь на следующую...",
-							model_name,
+							"[%s | %s] вернул код %s (%s) — переключаюсь на следующий API...",
+							route.name,
+							route.model,
 							response.status_code,
 							response.text[:160],
 						)
-						if idx < len(models_chain) - 1:
-							await asyncio.sleep(1.5)
+						if idx < len(self.routes) - 1:
+							await asyncio.sleep(0.8)
 						continue
 
 					response.raise_for_status()
 					data = response.json()
 					choices = data.get("choices")
 					if choices:
-						text = choices[0]["message"]["content"].strip()
-						# Достаём реальное имя модели, которая сгенерировала ответ
-						used_model = data.get("model") or model_name
-						clean_model = used_model.replace(":free", "")
+						text = (choices[0]["message"].get("content") or "").strip()
 
-						# Добавляем аккуратную подпись в конец ответа
-						signed_text = f"{text}\n\n—\n✨ <i>Модель: {clean_model}</i>"
+						# Защита от технических заглушек вроде "...response..." и обрезанных ответов
+						if not text or text == "...response..." or len(text) < 50:
+							logger.warning(
+								"[%s | %s] вернул некорректный ответ (%r) — переключаюсь на следующий API...",
+								route.name,
+								route.model,
+								text,
+							)
+							continue
+
+						used_model = (data.get("model") or route.model).replace(":free", "")
+						clean_model = used_model.removeprefix("@cf/")
+
+						signed_text = f"{text}\n\n—\n✨ <i>Модель: {clean_model} ({route.name})</i>"
 						return signed_text
 
 				except Exception as exc:
-					logger.error("Ошибка при обращении к модели %s: %s", model_name, exc)
+					logger.error(
+						"Сбой соединения с [%s | %s]: %s — переключаюсь дальше...",
+						route.name,
+						route.model,
+						exc,
+					)
 
-		logger.error("Все модели из цепочки OpenRouter оказались недоступны.")
+		logger.error("Все подключённые API-провайдеры оказались недоступны.")
 		return None
+
 
 	async def synthesize_spread(self, question: str, cards: list[TarotCard]) -> str | None:
 		c1, c2, c3 = cards
@@ -139,4 +177,3 @@ class OpenRouterService:
 			},
 		]
 		return await self._send_chat(messages)
-

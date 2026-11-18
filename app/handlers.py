@@ -1,11 +1,17 @@
-import html
+import asyncio
+from contextlib import suppress
 from datetime import timedelta, timezone
+import html
+from pathlib import Path
+import re
+import secrets
 
 from aiogram import F, Router
-from aiogram.enums import ChatAction, ChatType, ParseMode
+from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message
 
 from app.ai_service import OpenRouterService
 from app.cards_service import CardsRepository, TarotCard
@@ -26,27 +32,181 @@ from app.keyboards import (
 	get_history_keyboard,
 	get_main_menu_keyboard,
 )
+from app.spread_builder import build_spread_image
 from app.states import SpreadStates
 
-router = Router(name="private_messages")
-router.message.filter(F.chat.type == ChatType.PRIVATE)
+BASE_DIR = Path(__file__).resolve().parent.parent
+ASSETS_DIR = BASE_DIR / "assets"
+DECK_DIR = ASSETS_DIR / "deck"
+UI_DIR = ASSETS_DIR / "ui"
+TEMP_SPREADS_DIR = BASE_DIR / "data" / "temp_spreads"
+TEMP_SPREADS_DIR.mkdir(parents=True, exist_ok=True)
+
+PATH_WELCOME = UI_DIR / "welcome.webp"
+PATH_CARD_BACK = UI_DIR / "card_back.webp"
 
 MSK_TZ = timezone(timedelta(hours=3))
+UI_FILE_ID_CACHE: dict[str, str] = {}
 
-settings = load_settings()
-cards_repo = CardsRepository()
-ai_service = OpenRouterService(
-	api_key=settings.openrouter_api_key,
-	model=settings.openrouter_model,
-)
-db_repo = DatabaseRepository(
-	database_url=settings.database_url,
-	default_daily_limit=settings.daily_free_limit,
-)
+FOLLOWUP_RITUAL_STEPS = [
+	"🕯 <i>Осмысляю твоё уточнение...</i>",
+	"✨ <i>Всматриваюсь глубже в выпавшие арканы...</i>",
+	"📜 <i>Формулирую ответ...</i>",
+]
+
+
+def _sanitize_telegram_html(text: str) -> str:
+	"""Заменяет неподдерживаемые Telegram теги (вроде <br>) на обычные переносы."""
+	return re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+
+
+def _short_hint(text: str, max_len: int = 135) -> str:
+	"""Обрезает подсказку до 1–2 аккуратных строк."""
+	clean = " ".join(text.split())
+	if len(clean) <= max_len:
+		return clean
+	return clean[: max_len - 1].rsplit(" ", 1)[0] + "…"
+
+
+async def _animate_wait_message(
+	message: Message,
+	steps: list[str],
+	is_photo: bool = False,
+	interval: float = 2.0,
+) -> None:
+	"""Плавно меняет текст или подпись под рубашкой во время уточняющего вопроса."""
+	idx = 1
+	while True:
+		await asyncio.sleep(interval)
+		next_text = steps[min(idx, len(steps) - 1)]
+		with suppress(TelegramBadRequest):
+			if is_photo:
+				await message.edit_caption(caption=next_text, parse_mode=ParseMode.HTML)
+			else:
+				await message.edit_text(text=next_text, parse_mode=ParseMode.HTML)
+		idx += 1
+
+
+async def _send_and_reveal_three_cards(
+	message: Message,
+	cards: list[TarotCard],
+	image_ids: list[str | None],
+	step_delay: float = 2.0,
+) -> tuple[Message, asyncio.Task[None]]:
+	"""Отправляет 1-ю карту сразу и поочерёдно сменяет её на 2-ю и 3-ю (по 2 сек на каждую)."""
+	c1, c2, c3 = cards
+	positions = [
+		("1/3 • Ситуация сейчас", c1.situation_hint),
+		("2/3 • На что обратить внимание", c2.notice_hint),
+		("3/3 • Возможный следующий шаг", c3.next_step_hint),
+	]
+
+	def _build_caption(idx: int) -> str:
+		pos_title, hint = positions[idx]
+		text = (
+			f"🃏 <b>{pos_title}: {html.escape(cards[idx].name)}</b>\n"
+			f"<i>{html.escape(_short_hint(hint))}</i>"
+		)
+		if idx == 2:
+			text += "\n\n✨ <i>Собираю целостный отклик по всем трём картам...</i>"
+		return text
+
+	first_caption = _build_caption(0)
+	first_id = next(iter(image_ids), None)
+	first_path = (DECK_DIR / f"{first_id}.webp") if first_id else None
+
+	if first_path and first_path.exists():
+		key = str(first_path)
+		photo_source = UI_FILE_ID_CACHE.get(key) or FSInputFile(first_path)
+		wait_msg = await message.answer_photo(
+			photo=photo_source,
+			caption=first_caption,
+			parse_mode=ParseMode.HTML,
+		)
+		if wait_msg.photo and key not in UI_FILE_ID_CACHE:
+			UI_FILE_ID_CACHE[key] = wait_msg.photo[-1].file_id
+	else:
+		wait_msg = await message.answer(first_caption, parse_mode=ParseMode.HTML)
+
+	async def _sequence() -> None:
+		for idx in (1, 2):
+			await asyncio.sleep(step_delay)
+			caption = _build_caption(idx)
+			curr_id = image_ids[idx]
+			curr_path = (DECK_DIR / f"{curr_id}.webp") if curr_id else None
+			with suppress(TelegramBadRequest):
+				if curr_path and curr_path.exists():
+					key = str(curr_path)
+					media_source = UI_FILE_ID_CACHE.get(key) or FSInputFile(curr_path)
+					edited = await wait_msg.edit_media(
+						media=InputMediaPhoto(
+							media=media_source,
+							caption=caption,
+							parse_mode=ParseMode.HTML,
+						)
+					)
+					if isinstance(edited, Message) and edited.photo and key not in UI_FILE_ID_CACHE:
+						UI_FILE_ID_CACHE[key] = edited.photo[-1].file_id
+				elif wait_msg.photo:
+					await wait_msg.edit_caption(caption=caption, parse_mode=ParseMode.HTML)
+				else:
+					await wait_msg.edit_text(text=caption, parse_mode=ParseMode.HTML)
+
+		await asyncio.sleep(step_delay)
+
+	return wait_msg, asyncio.create_task(_sequence())
+
+
+
+
+_DECK_FILE_MAP: dict[str, str] | None = None
+
+
+def resolve_card_image_id(card_id: str) -> str | None:
+	"""Находит имя файла картинки в assets/deck по ID карты (учитывая префиксы вроде major_02)."""
+	global _DECK_FILE_MAP
+	if _DECK_FILE_MAP is None:
+		_DECK_FILE_MAP = {}
+		if DECK_DIR.exists():
+			for p in DECK_DIR.glob("*.webp"):
+				stem = p.stem
+				_DECK_FILE_MAP[stem] = stem
+				# Если файл называется например "02_high_priestess", сохраняем и "high_priestess"
+				parts = stem.split("_", 1)
+				if len(parts) == 2 and parts[0].isdigit():
+					_DECK_FILE_MAP[parts[1]] = stem
+
+	if card_id in _DECK_FILE_MAP:
+		return _DECK_FILE_MAP[card_id]
+
+	# Поиск по частичному совпадению (например "major_02" <-> "02_major")
+	clean_id = card_id.lower()
+	for stem in _DECK_FILE_MAP.values():
+		if clean_id in stem.lower() or stem.lower() in clean_id:
+			return stem
+
+	return None
+
+
+
+def draw_available_cards(count: int) -> list[TarotCard]:
+	"""Выбирает случайные карты только из тех, для которых уже готов .webp в assets/deck."""
+	picked: list[TarotCard] = []
+	seen_ids: set[str] = set()
+	for _ in range(500):
+		card = cards_repo.get_random_card()
+		if card.id in seen_ids:
+			continue
+		if resolve_card_image_id(card.id) is not None:
+			picked.append(card)
+			seen_ids.add(card.id)
+			if len(picked) == count:
+				return picked
+	return cards_repo.draw_three_cards()[:count]
 
 
 def find_card_by_id(card_id: str) -> TarotCard:
-	# Безопасно ищем карту по её ID в загруженной колоде
+	"""Безопасно ищем карту по её ID в загруженной колоде."""
 	if hasattr(cards_repo, "get_card_by_id"):
 		found = cards_repo.get_card_by_id(card_id)
 		if found is not None:
@@ -102,6 +262,17 @@ async def check_spread_access(telegram_id: int) -> tuple[bool, str]:
 	return False, text
 
 
+settings = load_settings()
+router = Router(name="tarot_main")
+db_repo = DatabaseRepository(settings.database_url, settings.daily_free_limit)
+cards_repo = CardsRepository()
+ai_service = OpenRouterService(
+	api_key=settings.openrouter_api_key,
+	model=settings.openrouter_model,
+	providers=settings.llm_providers,
+)
+
+
 @router.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext) -> None:
 	await state.clear()
@@ -112,15 +283,26 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 			first_name=message.from_user.first_name,
 		)
 
-	await message.answer(
+	welcome_caption = (
 		"Привет! Это <b>«Между звёзд»</b> — пространство для спокойной "
 		"саморефлексии через образы карт Таро.\n\n"
 		"Здесь нет предсказаний будущего и «правильных» толкований. "
 		"Карта — это зеркало, которое помогает прислушаться к себе.\n\n"
-		"Выбери практику в меню ниже. Остановиться можно в любой момент.",
-		parse_mode=ParseMode.HTML,
-		reply_markup=get_main_menu_keyboard(),
+		"Выбери практику в меню ниже. Остановиться можно в любой момент."
 	)
+	if PATH_WELCOME.exists():
+		await message.answer_photo(
+			photo=FSInputFile(PATH_WELCOME),
+			caption=welcome_caption,
+			parse_mode=ParseMode.HTML,
+			reply_markup=get_main_menu_keyboard(),
+		)
+	else:
+		await message.answer(
+			welcome_caption,
+			parse_mode=ParseMode.HTML,
+			reply_markup=get_main_menu_keyboard(),
+		)
 
 
 @router.message(Command("help"))
@@ -262,7 +444,7 @@ async def callback_view_reading(callback: CallbackQuery) -> None:
 		f"<i>Карты:</i> {reading.card_1_name} • {reading.card_2_name} • {reading.card_3_name}\n\n"
 	)
 
-	full_body = header + reading.ai_interpretation
+	full_body = _sanitize_telegram_html(header + reading.ai_interpretation)
 	for start in range(0, len(full_body), 4000):
 		await callback.message.answer(
 			full_body[start : start + 4000],
@@ -270,7 +452,7 @@ async def callback_view_reading(callback: CallbackQuery) -> None:
 		)
 
 	if reading.followup_question and reading.followup_answer:
-		followup_block = (
+		followup_block = _sanitize_telegram_html(
 			f"💬 <b>Твой уточняющий вопрос:</b>\n"
 			f"<i>{html.escape(reading.followup_question)}</i>\n\n"
 			f"<b>Отклик на уточнение:</b>\n"
@@ -287,7 +469,7 @@ async def callback_view_reading(callback: CallbackQuery) -> None:
 @router.message(F.text == BTN_CARD_OF_DAY)
 async def handle_day_card(message: Message, state: FSMContext) -> None:
 	await state.clear()
-	candidate = cards_repo.get_random_card()
+	(candidate,) = draw_available_cards(1)
 
 	if message.from_user:
 		saved_id, already_drawn = await db_repo.get_or_set_daily_card_id(
@@ -301,11 +483,23 @@ async def handle_day_card(message: Message, state: FSMContext) -> None:
 		card = candidate
 		already_drawn = False
 
-	await message.answer(
-		format_day_card(card, already_drawn=already_drawn),
-		parse_mode=ParseMode.HTML,
-		reply_markup=get_after_day_card_keyboard(),
-	)
+	day_text = format_day_card(card, already_drawn=already_drawn)
+	img_id = resolve_card_image_id(card.id)
+	photo_to_send = (DECK_DIR / f"{img_id}.webp") if img_id else PATH_CARD_BACK
+
+	if photo_to_send.exists():
+		await message.answer_photo(
+			photo=FSInputFile(photo_to_send),
+			caption=day_text,
+			parse_mode=ParseMode.HTML,
+			reply_markup=get_after_day_card_keyboard(),
+		)
+	else:
+		await message.answer(
+			day_text,
+			parse_mode=ParseMode.HTML,
+			reply_markup=get_after_day_card_keyboard(),
+		)
 
 
 @router.message(Command("spread"))
@@ -366,77 +560,151 @@ async def handle_cancel(message: Message, state: FSMContext) -> None:
 	)
 
 
-@router.message(SpreadStates.waiting_for_question, F.text)
+@router.message(SpreadStates.waiting_for_question)
 async def handle_spread_question(message: Message, state: FSMContext) -> None:
-	user_question = message.text.strip()
-	if len(user_question) < 3:
+	if not message.text:
 		await message.answer(
-			"Напиши чуть подробнее (хотя бы пару слов), "
-			"чтобы картам было на что опереться."
+			"Пожалуйста, сформулируй вопрос текстом в одном сообщении.",
+			reply_markup=get_cancel_keyboard(),
+		)
+		return
+
+	question = message.text.strip()
+	if question == BTN_CANCEL:
+		await handle_cancel(message, state)
+		return
+
+	if len(question) < 3:
+		await message.answer(
+			"Вопрос слишком короткий. Попробуй описать ситуацию чуть подробнее — "
+			"хотя бы в нескольких словах.",
+			reply_markup=get_cancel_keyboard(),
+		)
+		return
+
+	if len(question) > 500:
+		await message.answer(
+			"Сообщение получилось слишком длинным (больше 500 символов). "
+			"Сократи его, пожалуйста, до главного вопроса.",
+			reply_markup=get_cancel_keyboard(),
 		)
 		return
 
 	if message.from_user:
-		allowed, deny_text = await check_spread_access(message.from_user.id)
-		if not allowed:
+		used_today, effective_limit, is_premium = await db_repo.get_daily_usage(
+			telegram_id=message.from_user.id
+		)
+		if not is_premium and used_today >= effective_limit:
 			await state.clear()
 			await message.answer(
-				deny_text,
-				parse_mode=ParseMode.HTML,
+				f"Сегодняшний лимит бесплатных раскладов ({effective_limit} в день) исчерпан.\n"
+				"Возвращайся завтра или загляни в раздел «Карта дня».",
 				reply_markup=get_main_menu_keyboard(),
 			)
 			return
 
-	safe_question = user_question[:400]
-	drawn_cards = cards_repo.draw_three_cards()
-	c1, c2, c3 = drawn_cards
+	await state.clear()
 
-	await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-	wait_msg = await message.answer(
-		f"🌌 <b>Выпавшие карты:</b>\n"
-		f"1. Ситуация сейчас — <b>{c1.name}</b>\n"
-		f"2. На что обратить внимание — <b>{c2.name}</b>\n"
-		f"3. Возможный следующий шаг — <b>{c3.name}</b>\n\n"
-		f"<i>Собираю спокойный отклик под твой запрос...</i>",
-		parse_mode=ParseMode.HTML,
+	# 1. Вытягиваем 3 карты сразу
+	drawn_cards = draw_available_cards(3)
+	c1, c2, c3 = drawn_cards
+	img1 = resolve_card_image_id(c1.id)
+	img2 = resolve_card_image_id(c2.id)
+	img3 = resolve_card_image_id(c3.id)
+
+	# 2. Сразу показываем 1-ю карту и запускаем показ 2-й и 3-й (по 2 сек на каждую)
+	wait_msg, reveal_task = await _send_and_reveal_three_cards(
+		message=message,
+		cards=drawn_cards,
+		image_ids=[img1, img2, img3],
+		step_delay=2.0,
 	)
 
-	ai_reply = await ai_service.synthesize_spread(safe_question, drawn_cards)
-	final_text = ai_reply if ai_reply else format_fallback_spread(safe_question, drawn_cards)
+	# 3. Параллельно запрашиваем ответ нейросети и клеим финальный коллаж
+	ai_task = asyncio.create_task(
+		ai_service.synthesize_spread(question=question, cards=drawn_cards)
+	)
 
-	reading_id: int | None = None
+	collage_path: Path | None = None
+	try:
+		if img1 and img2 and img3:
+			spread_cards_data = [
+				{"id": img1, "position": "1. СИТУАЦИЯ", "reversed": False},
+				{"id": img2, "position": "2. ВНИМАНИЕ", "reversed": False},
+				{"id": img3, "position": "3. СЛЕДУЮЩИЙ ШАГ", "reversed": False},
+			]
+			token = secrets.token_hex(4)
+			collage_path = TEMP_SPREADS_DIR / f"spread_{message.chat.id}_{token}.webp"
+			await asyncio.to_thread(
+				build_spread_image,
+				cards_data=spread_cards_data,
+				output_path=collage_path,
+				spread_title="РАСКЛАД МЕЖДУ ЗВЁЗД",
+				deck_dir=DECK_DIR,
+			)
+		_, interpretation = await asyncio.gather(reveal_task, ai_task)
+	finally:
+		for task in (reveal_task, ai_task):
+			if not task.done():
+				task.cancel()
+				with suppress(asyncio.CancelledError):
+					await task
+
+	# 4. Убираем одиночную карту и выкладываем общий коллаж из 3 карт
+	with suppress(TelegramBadRequest):
+		await wait_msg.delete()
+
+	if collage_path and collage_path.exists():
+		await message.answer_photo(
+			photo=FSInputFile(collage_path),
+			caption=(
+				f"🌌 <b>Карты расклада:</b> "
+				f"{html.escape(c1.name)} • {html.escape(c2.name)} • {html.escape(c3.name)}"
+			),
+			parse_mode=ParseMode.HTML,
+		)
+		collage_path.unlink(missing_ok=True)
+
+	if not interpretation:
+		interpretation = format_fallback_spread(question=question, cards=drawn_cards)
+
+	# 5. Сохраняем в БД и отправляем полный разбор
+	reading_id = None
 	if message.from_user:
-		saved_reading = await db_repo.create_reading(
+		reading = await db_repo.create_reading(
 			telegram_id=message.from_user.id,
 			username=message.from_user.username,
 			first_name=message.from_user.first_name,
-			question=safe_question,
+			question=question,
 			card_names=[c1.name, c2.name, c3.name],
-			ai_interpretation=final_text,
+			ai_interpretation=interpretation,
 		)
-		reading_id = saved_reading.id
+		reading_id = reading.id
+
+	cards_header = (
+		f"<b>Выпавшие карты:</b>\n"
+		f"1. Ситуация — <b>{html.escape(c1.name)}</b>\n"
+		f"2. На что обратить внимание — <b>{html.escape(c2.name)}</b>\n"
+		f"3. Следующий шаг — <b>{html.escape(c3.name)}</b>\n\n"
+	)
 
 	cards_summary = (
-		f"1. Ситуация: {c1.name} ({c1.situation_hint})\n"
-		f"2. Внимание: {c2.name} ({c2.notice_hint})\n"
-		f"3. Шаг: {c3.name} ({c3.next_step_hint})"
+		f"1. Ситуация сейчас: {c1.name}\n"
+		f"2. На что обратить внимание: {c2.name}\n"
+		f"3. Возможный следующий шаг: {c3.name}"
 	)
-
 	await state.update_data(
 		reading_id=reading_id,
-		original_question=safe_question,
+		original_question=question,
 		cards_summary=cards_summary,
-		previous_reply=final_text,
+		previous_reply=interpretation,
 	)
-	await state.set_state(None)
 
-	await wait_msg.delete()
+	full_text = _sanitize_telegram_html(f"{cards_header}{interpretation}")
 	await message.answer(
-		f"🌌 <b>Расклад «Между звёзд»</b>\n"
-		f"<i>Карты: {c1.name} • {c2.name} • {c3.name}</i>\n\n"
-		f"{final_text}",
+		full_text,
 		parse_mode=ParseMode.HTML,
-		reply_markup=get_after_spread_keyboard(reading_id=reading_id, can_followup=True),
+		reply_markup=get_after_spread_keyboard(reading_id=reading_id),
 	)
 
 
@@ -458,87 +726,107 @@ async def callback_ask_followup(callback: CallbackQuery, state: FSMContext) -> N
 		)
 
 
-@router.message(SpreadStates.waiting_for_followup, F.text)
+@router.message(SpreadStates.waiting_for_followup)
 async def handle_followup_question(message: Message, state: FSMContext) -> None:
-	followup = message.text.strip()
-	if len(followup) < 3:
-		await message.answer("Напиши вопрос чуть подробнее.")
+	if not message.text:
+		await message.answer(
+			"Напиши уточняющий вопрос текстом в одном сообщении.",
+			reply_markup=get_cancel_keyboard(),
+		)
+		return
+
+	followup_question = message.text.strip()
+	if followup_question == BTN_CANCEL:
+		await handle_cancel(message, state)
+		return
+
+	if len(followup_question) < 3:
+		await message.answer(
+			"Вопрос слишком короткий. Уточни, пожалуйста, чуть подробнее.",
+			reply_markup=get_cancel_keyboard(),
+		)
+		return
+
+	if len(followup_question) > 400:
+		await message.answer(
+			"Уточняющий вопрос слишком длинный (максимум 400 символов). "
+			"Сформулируй его короче.",
+			reply_markup=get_cancel_keyboard(),
+		)
 		return
 
 	data = await state.get_data()
 	reading_id = data.get("reading_id")
-	original_question = data.get("original_question", "")
-	cards_summary = data.get("cards_summary", "")
-	previous_reply = data.get("previous_reply", "")
-	safe_followup = followup[:300]
+	original_question = data.get("original_question")
+	cards_summary = data.get("cards_summary")
+	previous_reply = data.get("previous_reply")
 
-	await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-	wait_msg = await message.answer("<i>Осмысляю уточнение...</i>", parse_mode=ParseMode.HTML)
-
-	ai_followup = await ai_service.answer_followup(
-		original_question=original_question,
-		cards_summary=cards_summary,
-		previous_reply=previous_reply,
-		followup_question=safe_followup,
-	)
-
-	await wait_msg.delete()
 	await state.clear()
 
-	reply_text = ai_followup or (
-		"Сейчас связь с языковой моделью временно недоступна, "
-		"но ты можешь опереться на три выпавшие карты и вопрос для паузы выше."
-	)
-
-	saved_id = reading_id if isinstance(reading_id, int) else None
-	if saved_id is not None:
-		await db_repo.save_followup(
-			reading_id=saved_id,
-			followup_question=safe_followup,
-			followup_answer=reply_text,
+	if not original_question or not cards_summary or not previous_reply:
+		await message.answer(
+			"Не удалось найти контекст прошлого расклада. Сделай новый расклад на 3 карты.",
+			reply_markup=get_main_menu_keyboard(),
 		)
-
-	await message.answer(
-		f"💬 <b>Отклик на уточнение:</b>\n\n"
-		f"{reply_text}\n\n"
-		f"<i>На этом разбор завершён. Буду рад твоей оценке ниже:</i>",
-		parse_mode=ParseMode.HTML,
-		reply_markup=get_after_spread_keyboard(reading_id=saved_id, can_followup=False),
-	)
-
-
-@router.callback_query(F.data.startswith("rate:"))
-async def callback_rate_reading(callback: CallbackQuery) -> None:
-	if not callback.from_user or not callback.message or not callback.data:
-		await callback.answer()
 		return
 
-	parts = callback.data.split(":")
-	if len(parts) != 3 or not parts[1].isdigit():
-		await callback.answer()
-		return
-
-	reading_id = int(parts[1])
-	vote = parts[2]
-
-	if vote == "up":
-		await db_repo.save_reading_feedback(
-			reading_id=reading_id,
-			telegram_id=callback.from_user.id,
-			score=1,
+	first_step_idx = 0
+	has_card_back = PATH_CARD_BACK.exists()
+	if has_card_back:
+		back_key = str(PATH_CARD_BACK)
+		photo_source = UI_FILE_ID_CACHE.get(back_key) or FSInputFile(PATH_CARD_BACK)
+		wait_msg = await message.answer_photo(
+			photo=photo_source,
+			caption=FOLLOWUP_RITUAL_STEPS[first_step_idx],
+			parse_mode=ParseMode.HTML,
 		)
-		await callback.answer("Спасибо за отклик! Рад, что разбор оказался полезным.")
-		await callback.message.edit_reply_markup(reply_markup=None)
+		if wait_msg.photo and back_key not in UI_FILE_ID_CACHE:
+			UI_FILE_ID_CACHE[back_key] = wait_msg.photo[-1].file_id
 	else:
-		await db_repo.save_reading_feedback(
+		wait_msg = await message.answer(
+			FOLLOWUP_RITUAL_STEPS[first_step_idx],
+			parse_mode=ParseMode.HTML,
+		)
+
+	ritual_task = asyncio.create_task(
+		_animate_wait_message(wait_msg, FOLLOWUP_RITUAL_STEPS, is_photo=has_card_back)
+	)
+
+	try:
+		followup_reply = await ai_service.answer_followup(
+			original_question=original_question,
+			cards_summary=cards_summary,
+			previous_reply=previous_reply,
+			followup_question=followup_question,
+		)
+	finally:
+		ritual_task.cancel()
+		with suppress(asyncio.CancelledError):
+			await ritual_task
+		with suppress(TelegramBadRequest):
+			await wait_msg.delete()
+
+	if not followup_reply:
+		followup_reply = (
+			"Сейчас сложно уловить тонкий отклик. Попробуй вернуться к уже выпавшим "
+			"картам чуть позже и посмотреть, какая из них вызывает самый сильный отклик."
+		)
+
+	if reading_id and message.from_user:
+		await db_repo.save_followup(
 			reading_id=reading_id,
-			telegram_id=callback.from_user.id,
-			score=-1,
+			followup_question=followup_question,
+			followup_answer=followup_reply,
 		)
-		await callback.answer("Спасибо за честность!")
-		await callback.message.edit_reply_markup(
-			reply_markup=get_dislike_reason_keyboard(reading_id)
-		)
+
+	clean_reply = _sanitize_telegram_html(followup_reply)
+	await message.answer(
+		f"✨ <b>Уточнение по раскладу:</b>\n\n{clean_reply}",
+		parse_mode=ParseMode.HTML,
+		reply_markup=get_main_menu_keyboard(),
+	)
+
+
 
 
 @router.callback_query(F.data.startswith("reason:"))
@@ -582,3 +870,6 @@ async def handle_fallback(message: Message) -> None:
 		"Выбери практику на клавиатуре ниже или отправь /start, чтобы открыть меню.",
 		reply_markup=get_main_menu_keyboard(),
 	)
+
+
+

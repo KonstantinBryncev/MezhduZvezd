@@ -16,3 +16,5 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+config_tarot.json 
+smart_tarot_generator-v2.py 
